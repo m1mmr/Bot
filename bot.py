@@ -49,9 +49,6 @@ dp      = Dispatcher(storage=storage)
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
 
-class ClientStates(StatesGroup):
-    rating = State()
-
 
 # ════════════════════════════════════════════
 #   БАЗА ДАННЫХ (SQLite)
@@ -171,6 +168,18 @@ def db_get_all_users(limit=20):
     return rows, total
 
 
+def db_restore_queue() -> dict:
+    """При старте восстанавливает активные/ожидающие заявки из БД в память"""
+    restored = {}
+    with db_connect() as con:
+        # Сбрасываем зависшие заявки прошлых сессий
+        con.execute(
+            "UPDATE requests SET status='closed' WHERE status IN ('active','waiting')"
+        )
+        con.commit()
+    return restored
+
+
 # ════════════════════════════════════════════
 #   ОЧЕРЕДЬ В ПАМЯТИ
 # ════════════════════════════════════════════
@@ -178,6 +187,10 @@ def db_get_all_users(limit=20):
 # queue хранит активные/ожидающие заявки текущей сессии
 # {request_id: {"user_id": int, "status": str, "created_at": str}}
 queue = {}
+
+# Словарь для хранения req_id ожидающего оценки для каждого клиента
+# {user_id: req_id}
+pending_ratings: dict[int, int] = {}
 
 
 # ════════════════════════════════════════════
@@ -475,7 +488,7 @@ async def cb_accept(callback: types.CallbackQuery):
         return
     req_id = int(callback.data.split("_")[1])
     if req_id not in queue:
-        await callback.answer("❌ Заявка не найдена.", show_alert=True)
+        await callback.answer("❌ Заявка уже обработана или бот был перезапущен.", show_alert=True)
         return
     queue[req_id]["status"] = "active"
     db_update_request_status(req_id, "active")
@@ -502,7 +515,7 @@ async def cb_reject(callback: types.CallbackQuery):
         return
     req_id = int(callback.data.split("_")[1])
     if req_id not in queue:
-        await callback.answer("❌ Заявка не найдена.", show_alert=True)
+        await callback.answer("❌ Заявка уже обработана или бот был перезапущен.", show_alert=True)
         return
     client_id = queue[req_id]["user_id"]
     db_update_request_status(req_id, "rejected")
@@ -526,11 +539,18 @@ async def cb_profile(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     req_id = int(callback.data.split("_")[1])
-    if req_id not in queue:
-        await callback.answer("❌ Заявка не найдена.", show_alert=True)
-        return
+    # Ищем user_id: сначала в очереди, потом в БД
+    if req_id in queue:
+        user_id = queue[req_id]["user_id"]
+    else:
+        with db_connect() as con:
+            row = con.execute("SELECT user_id FROM requests WHERE id=?", (req_id,)).fetchone()
+        if not row:
+            await callback.answer("❌ Заявка не найдена.", show_alert=True)
+            return
+        user_id = row[0]
     await callback.answer()
-    await bot.send_message(ADMIN_ID, fmt_profile(queue[req_id]["user_id"]))
+    await bot.send_message(ADMIN_ID, fmt_profile(user_id))
 
 
 @dp.callback_query(F.data.startswith("history_"))
@@ -538,11 +558,18 @@ async def cb_history(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     req_id = int(callback.data.split("_")[1])
-    if req_id not in queue:
-        await callback.answer("❌ Заявка не найдена.", show_alert=True)
-        return
+    # Ищем user_id: сначала в очереди, потом в БД
+    if req_id in queue:
+        user_id = queue[req_id]["user_id"]
+    else:
+        with db_connect() as con:
+            row = con.execute("SELECT user_id FROM requests WHERE id=?", (req_id,)).fetchone()
+        if not row:
+            await callback.answer("❌ Заявка не найдена.", show_alert=True)
+            return
+        user_id = row[0]
     await callback.answer()
-    await bot.send_message(ADMIN_ID, fmt_history(queue[req_id]["user_id"]))
+    await bot.send_message(ADMIN_ID, fmt_history(user_id))
 
 
 # ════════════════════════════════════════════
@@ -550,9 +577,9 @@ async def cb_history(callback: types.CallbackQuery):
 # ════════════════════════════════════════════
 
 @dp.callback_query(F.data.startswith("rate_"))
-async def cb_rate(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    req_id = data.get("rating_req_id")
+async def cb_rate(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    req_id  = pending_ratings.get(user_id)
 
     if callback.data == "rate_skip":
         await callback.message.edit_text(
@@ -560,7 +587,7 @@ async def cb_rate(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=None,
         )
         await callback.answer()
-        await state.clear()
+        pending_ratings.pop(user_id, None)
         return
 
     rating = int(callback.data.split("_")[1])
@@ -568,6 +595,7 @@ async def cb_rate(callback: types.CallbackQuery, state: FSMContext):
 
     if req_id:
         db_set_rating(req_id, rating)
+        pending_ratings.pop(user_id, None)
 
     await callback.message.edit_text(
         f"🙏 <b>Спасибо за оценку!</b>\n\n"
@@ -576,14 +604,14 @@ async def cb_rate(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=None,
     )
     await callback.answer("Спасибо!")
-    await state.clear()
 
     # Уведомляем админа
-    await bot.send_message(
-        ADMIN_ID,
-        f"⭐ <b>Новая оценка по заявке #{req_id}</b>\n\n"
-        f"Клиент поставил: {stars} ({rating}/5)"
-    )
+    if req_id:
+        await bot.send_message(
+            ADMIN_ID,
+            f"⭐ <b>Новая оценка по заявке #{req_id}</b>\n\n"
+            f"Клиент поставил: {stars} ({rating}/5)"
+        )
 
 
 # ════════════════════════════════════════════
@@ -728,8 +756,8 @@ async def chat_handler(message: types.Message, state: FSMContext):
                 f"✅ <b>Сделка #{req_id} закрыта!</b>",
                 reply_markup=ReplyKeyboardRemove(),
             )
-            # Просим клиента оставить оценку
-            await state.update_data(rating_req_id=req_id)
+            # Сохраняем req_id для оценки клиента
+            pending_ratings[client_id] = req_id
             await bot.send_message(
                 client_id,
                 f"🎉 <b>Сделка успешно завершена!</b>\n\n"
@@ -860,6 +888,7 @@ async def chat_handler(message: types.Message, state: FSMContext):
 
 async def main():
     db_init()
+    db_restore_queue()   # сбрасываем зависшие заявки прошлых сессий
     logging.info("🌲 Бот запущен!")
     await dp.start_polling(bot)
 
