@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 #   ⚙️  НАСТРОЙКИ — ИЗМЕНИТЕ ПОД СЕБЯ
 # ╚══════════════════════════════════════════╝
 
-TOKEN    = "8735847211:AAFgiY61R6jc7yx4mpKNziXyIKKFJX0z20o"
+TOKEN    = "8545768425:AAFe2N1nyGDZau54nsjPu6LThYFQUfr2yns"
 ADMIN_ID = 8677023495
 
 # Фото-баннер: путь к файлу, URL или None
