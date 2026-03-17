@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime
+from aiohttp import web                          # ← keep-alive сервер
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -34,6 +35,36 @@ SHOP_NAME    = "🌲 SHOP"
 SHOP_TAGLINE = "Товары для настоящих ценителей природы!"
 
 DB_PATH = "shop.db"   # файл базы данных (создаётся автоматически)
+
+# ════════════════════════════════════════════
+#   🌐 KEEP-ALIVE: встроенный HTTP-сервер
+#   Render требует открытый порт — иначе усыпляет.
+#   Внешний сервис (cron-job.org / UptimeRobot)
+#   пингует /ping каждые 5–10 минут.
+# ════════════════════════════════════════════
+
+KEEP_ALIVE_PORT = 8080   # Render автоматически прокидывает $PORT, но 8080 — дефолт
+
+async def handle_ping(request: web.Request) -> web.Response:
+    """Эндпоинт /ping — отвечает 200 OK, не даёт Render усыпить сервис."""
+    return web.Response(text="OK", status=200)
+
+async def handle_root(request: web.Request) -> web.Response:
+    return web.Response(text=f"{SHOP_NAME} bot is running ✅", status=200)
+
+async def start_web_server():
+    """Запускает лёгкий aiohttp-сервер в фоне."""
+    app = web.Application()
+    app.router.add_get("/",     handle_root)
+    app.router.add_get("/ping", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render передаёт порт через переменную окружения PORT
+    import os
+    port = int(os.environ.get("PORT", KEEP_ALIVE_PORT))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"🌐 Keep-alive сервер запущен на порту {port}")
 
 # ════════════════════════════════════════════
 
@@ -184,12 +215,7 @@ def db_restore_queue() -> dict:
 #   ОЧЕРЕДЬ В ПАМЯТИ
 # ════════════════════════════════════════════
 
-# queue хранит активные/ожидающие заявки текущей сессии
-# {request_id: {"user_id": int, "status": str, "created_at": str}}
 queue = {}
-
-# Словарь для хранения req_id ожидающего оценки для каждого клиента
-# {user_id: req_id}
 pending_ratings: dict[int, int] = {}
 
 
@@ -515,7 +541,7 @@ async def cb_reject(callback: types.CallbackQuery):
         return
     req_id = int(callback.data.split("_")[1])
     if req_id not in queue:
-        await callback.answer("❌ Заявка уже обработана или бот был перезапущен.", show_alert=True)
+        await callback.answer("❌ Заявка уже обработана или бот была перезапущен.", show_alert=True)
         return
     client_id = queue[req_id]["user_id"]
     db_update_request_status(req_id, "rejected")
@@ -539,7 +565,6 @@ async def cb_profile(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     req_id = int(callback.data.split("_")[1])
-    # Ищем user_id: сначала в очереди, потом в БД
     if req_id in queue:
         user_id = queue[req_id]["user_id"]
     else:
@@ -558,7 +583,6 @@ async def cb_history(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     req_id = int(callback.data.split("_")[1])
-    # Ищем user_id: сначала в очереди, потом в БД
     if req_id in queue:
         user_id = queue[req_id]["user_id"]
     else:
@@ -605,7 +629,6 @@ async def cb_rate(callback: types.CallbackQuery):
     )
     await callback.answer("Спасибо!")
 
-    # Уведомляем админа
     if req_id:
         await bot.send_message(
             ADMIN_ID,
@@ -756,7 +779,6 @@ async def chat_handler(message: types.Message, state: FSMContext):
                 f"✅ <b>Сделка #{req_id} закрыта!</b>",
                 reply_markup=ReplyKeyboardRemove(),
             )
-            # Сохраняем req_id для оценки клиента
             pending_ratings[client_id] = req_id
             await bot.send_message(
                 client_id,
@@ -816,7 +838,6 @@ async def chat_handler(message: types.Message, state: FSMContext):
             )
             return
 
-        # ✅ Рассылка через кнопку — устанавливает FSM-состояние
         if text == "📢 Рассылка":
             await message.answer(
                 "📢 <b>Рассылка</b>\n\n"
@@ -856,7 +877,6 @@ async def chat_handler(message: types.Message, state: FSMContext):
     for req_id, data in queue.items():
         if data["user_id"] == user_id and data["status"] == "active":
             name = message.from_user.first_name
-            # Пересылаем медиа администратору
             if message.photo:
                 await bot.send_photo(ADMIN_ID, message.photo[-1].file_id,
                                      caption=f"📸 <b>{name}:</b>\n{message.caption or ''}",
@@ -888,9 +908,13 @@ async def chat_handler(message: types.Message, state: FSMContext):
 
 async def main():
     db_init()
-    db_restore_queue()   # сбрасываем зависшие заявки прошлых сессий
+    db_restore_queue()
     logging.info("🌲 Бот запущен!")
-    await dp.start_polling(bot)
+    # Запускаем веб-сервер и бота параллельно
+    await asyncio.gather(
+        start_web_server(),
+        dp.start_polling(bot),
+    )
 
 
 if __name__ == "__main__":
